@@ -42,6 +42,18 @@ async function main() {
   );
   const sampleAgreementAddress = factory.interface.parseLog(event).args.agreementAddress;
   console.log("Sample agreement deployed to:", sampleAgreementAddress);
+
+  // Automatically sync addresses to frontend
+  import("node:fs").then(({ writeFileSync }) => {
+    const content = `export const CONTRACT_ADDRESSES = {
+  RentalAgreementFactory: "${factoryAddress}",
+  MultiTenantRentalPlatform: "${platformAddress}",
+  SampleAgreement: "${sampleAgreementAddress}"
+};
+`;
+    writeFileSync("./frontend/src/contracts/contractAddress.js", content);
+    console.log("Updated frontend/src/contracts/contractAddress.js successfully!");
+  });
 }
 
 main().catch((error) => {
