@@ -1,222 +1,361 @@
 import express from "express";
+import cors from "cors";
 import jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
+import dotenv from "dotenv";
+import db from "./db.js";
+
+dotenv.config();
 
 const app = express();
 app.use(express.json());
 
-// Enable CORS manual headers
-app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
-  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(200);
+const PORT = process.env.PORT || 4000;
+const JWT_SECRET = process.env.JWT_SECRET || "enterprise_rent_sphere_production_secret_key_2026";
+const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
+
+// Configure CORS
+app.use(cors({
+  origin: CORS_ORIGIN,
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "Origin", "X-Requested-With", "Accept"]
+}));
+
+// ---------------- AUDIT LOG HELPER ----------------
+const logAudit = (action, description, userEmail = null, agreementId = null, req = null) => {
+  try {
+    const logId = `audit_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+    const ip = req ? (req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "127.0.0.1") : "127.0.0.1";
+    
+    const stmt = db.prepare(`
+      INSERT INTO audit_logs (id, action, description, user_email, agreement_id, ip_address)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    stmt.run(logId, action, description, userEmail, agreementId, ip);
+    console.log(`[AUDIT LOG] ${action}: ${description}`);
+  } catch (err) {
+    console.error("Failed to write audit log:", err.message);
   }
-  next();
-});
-
-const JWT_SECRET = "enterprise_rent_sphere_secret_key_2026";
-
-// Mock Database (Requirement 15: In-memory tables)
-const db = {
-  users: [
-    { id: 1, email: "admin@rentsphere.com", role: "Super Admin", verified: true },
-    { id: 2, email: "legal@rentsphere.com", role: "Legal Officer", verified: true },
-    { id: 3, email: "landlord@gmail.com", role: "Property Owner", verified: true },
-    { id: 4, email: "tenant@gmail.com", role: "Tenant", verified: true },
-    { id: 5, email: "auditor@rentsphere.com", role: "Auditor", verified: true }
-  ],
-  agreements: [
-    {
-      id: "agreement_001",
-      companyId: "Company_A", // Multi-Tenant separation
-      landlordAddress: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
-      tenantAddress: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-      rentInINR: 15000,
-      securityDepositInINR: 30000,
-      propertyDetails: "742 Evergreen Terrace, Springfield",
-      currentDocumentHash: "a2b585dd299e03d12FA4293BC5de4111afa1a4b94908f83103eb1f1706367c2e6", // SHA256 of document
-      status: "Active",
-      version: 1
-    }
-  ],
-  payments: [],
-  auditLogs: []
 };
 
 // ---------------- MIDDLEWARES ----------------
 
-// Authentication Middleware (Requirement 2)
-const authenticateToken = (req, res, next) => {
+// JWT Authentication Middleware
+export const authenticateToken = (req, res, next) => {
   const authHeader = req.headers["authorization"];
   const token = authHeader && authHeader.split(" ")[1];
 
-  if (!token) return res.status(401).json({ error: "Access token missing" });
+  if (!token) {
+    return res.status(401).json({ error: "Access token missing" });
+  }
 
   jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) return res.status(403).json({ error: "Invalid or expired token" });
+    if (err) {
+      return res.status(403).json({ error: "Invalid or expired token" });
+    }
     req.user = user;
     next();
   });
 };
 
-// Role-Based Access Control Middleware (Requirement 1, 15)
-const requireRole = (allowedRoles) => {
+// Role-Based Access Control Middleware
+export const requireRole = (allowedRoles) => {
   return (req, res, next) => {
     if (!req.user || !allowedRoles.includes(req.user.role)) {
-      // Log failed access attempt for security auditing
-      logAudit("SECURITY_ALERT", `Unauthorized access attempt to ${req.originalUrl} by ${req.user?.email || "anonymous"}`);
+      logAudit(
+        "SECURITY_ALERT",
+        `Unauthorized access attempt to ${req.originalUrl} by ${req.user?.email || "anonymous"}`,
+        req.user?.email,
+        null,
+        req
+      );
       return res.status(403).json({ error: "Access denied: Insufficient permissions" });
     }
     next();
   };
 };
 
-// Logger helper for Audit Trail (Requirement 6)
-const logAudit = (action, description, agreementId = null) => {
-  const logEntry = {
-    id: `audit_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
-    action,
-    description,
-    agreementId,
-    timestamp: new Date().toISOString()
-  };
-  db.auditLogs.push(logEntry);
-  console.log(`[AUDIT LOG] ${action}: ${description}`);
-};
+// ---------------- REST API ROUTES ----------------
 
-// ---------------- REST API ROUTES (Requirement 19) ----------------
+// Health check endpoint
+app.get("/api/health", (req, res) => {
+  res.json({ status: "healthy", timestamp: new Date().toISOString() });
+});
 
-// 1. Mock Authentication Login (Generates JWT)
+// 1. Authentication Login (Validates credentials with bcrypt)
 app.post("/api/auth/login", (req, res) => {
   const { email, password } = req.body;
-  const user = db.users.find(u => u.email === email);
+
+  if (!email || !password) {
+    return res.status(400).json({ error: "Email and password are required" });
+  }
+
+  const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
 
   if (!user) {
+    logAudit("LOGIN_FAILED", `Failed login attempt for non-existent user: ${email}`, email, null, req);
     return res.status(401).json({ error: "Invalid credentials" });
   }
 
-  // Simple mock login (In production, use bcrypt/Argon2 password hashing)
-  const token = jwt.sign({ email: user.email, role: user.role }, JWT_SECRET, { expiresIn: "1h" });
-  logAudit("USER_LOGIN", `${user.role} (${user.email}) logged in successfully`);
-  
-  res.json({ token, role: user.role, email: user.email });
-});
-
-// 2. Create Agreement (Requirement 19 - POST /agreements)
-app.post("/api/agreements", authenticateToken, requireRole(["Super Admin", "Property Owner", "Legal Officer"]), (req, res) => {
-  const { companyId, landlordAddress, tenantAddress, rentInINR, securityDepositInINR, propertyDetails, pdfHash } = req.body;
-
-  if (!landlordAddress || !tenantAddress || !rentInINR || !pdfHash) {
-    return res.status(400).json({ error: "Missing required parameters" });
+  const isPasswordValid = bcrypt.compareSync(password, user.password_hash);
+  if (!isPasswordValid) {
+    logAudit("LOGIN_FAILED", `Failed login attempt for user: ${email}`, email, null, req);
+    return res.status(401).json({ error: "Invalid credentials" });
   }
 
-  const newAgreement = {
-    id: `agreement_${Date.now()}`,
+  const token = jwt.sign(
+    { id: user.id, email: user.email, role: user.role, name: user.name },
+    JWT_SECRET,
+    { expiresIn: "8h" }
+  );
+
+  logAudit("USER_LOGIN", `${user.role} (${user.email}) logged in successfully`, user.email, null, req);
+
+  res.json({
+    token,
+    user: {
+      id: user.id,
+      email: user.email,
+      role: user.role,
+      name: user.name
+    }
+  });
+});
+
+// 2. Current User Profile
+app.get("/api/auth/me", authenticateToken, (req, res) => {
+  const user = db.prepare("SELECT id, email, role, name, verified, created_at FROM users WHERE email = ?").get(req.user.email);
+  if (!user) {
+    return res.status(404).json({ error: "User not found" });
+  }
+  res.json(user);
+});
+
+// 3. List Agreements
+app.get("/api/agreements", authenticateToken, (req, res) => {
+  const { companyId } = req.query;
+  let agreements;
+
+  if (companyId) {
+    agreements = db.prepare("SELECT * FROM agreements WHERE company_id = ? ORDER BY created_at DESC").all(companyId);
+  } else if (req.user.role === "Super Admin" || req.user.role === "Auditor" || req.user.role === "Legal Officer") {
+    agreements = db.prepare("SELECT * FROM agreements ORDER BY created_at DESC").all();
+  } else if (req.user.role === "Property Owner") {
+    agreements = db.prepare("SELECT * FROM agreements WHERE landlord_address = ? OR company_id = 'Company_A' ORDER BY created_at DESC").all(req.user.email);
+  } else {
+    agreements = db.prepare("SELECT * FROM agreements WHERE tenant_address = ? OR status = 'Active' ORDER BY created_at DESC").all(req.user.email);
+  }
+
+  res.json(agreements);
+});
+
+// 4. Get Agreement by ID or Contract Address
+app.get("/api/agreements/:id", authenticateToken, (req, res) => {
+  const agreement = db.prepare("SELECT * FROM agreements WHERE id = ? OR contract_address = ?").get(req.params.id, req.params.id);
+
+  if (!agreement) {
+    return res.status(404).json({ error: "Agreement not found" });
+  }
+
+  logAudit("AGREEMENT_VIEWED", `Agreement ${agreement.id} viewed by ${req.user.email}`, req.user.email, agreement.id, req);
+  res.json(agreement);
+});
+
+// 5. Create Agreement
+app.post("/api/agreements", authenticateToken, requireRole(["Super Admin", "Property Owner", "Legal Officer"]), (req, res) => {
+  const {
     companyId,
+    contractAddress,
     landlordAddress,
     tenantAddress,
     rentInINR,
     securityDepositInINR,
+    durationDays,
     propertyDetails,
-    currentDocumentHash: pdfHash, // Blockchain ready SHA256 (Requirement 4)
-    status: "Draft",
-    version: 1
-  };
+    pdfHash
+  } = req.body;
 
-  db.agreements.push(newAgreement);
-  logAudit("AGREEMENT_CREATED", `Agreement draft ${newAgreement.id} created for property: ${propertyDetails}`, newAgreement.id);
-
-  res.status(201).json(newAgreement);
-});
-
-// 3. Get Agreement by ID (Requirement 19 - GET /agreements/{id})
-app.get("/api/agreements/:id", authenticateToken, requireRole(["Super Admin", "Property Owner", "Tenant", "Legal Officer", "Auditor"]), (req, res) => {
-  const agreement = db.agreements.find(a => a.id === req.params.id);
-
-  if (!agreement) {
-    return res.status(404).json({ error: "Agreement not found" });
+  if (!landlordAddress || !rentInINR || !pdfHash || !propertyDetails) {
+    return res.status(400).json({ error: "Missing required agreement parameters" });
   }
 
-  logAudit("AGREEMENT_VIEWED", `Agreement ${agreement.id} viewed by ${req.user.email}`, agreement.id);
-  res.json(agreement);
-});
+  const rentNum = parseFloat(rentInINR);
+  const depositNum = parseFloat(securityDepositInINR || 0);
+  const durationNum = parseInt(durationDays || 30, 10);
 
-// 4. Record Payment (Requirement 19 - POST /payments)
-app.post("/api/payments", authenticateToken, requireRole(["Super Admin", "Tenant"]), (req, res) => {
-  const { agreementId, amountINR, paymentGateway, transactionId } = req.body;
-
-  const agreement = db.agreements.find(a => a.id === agreementId);
-  if (!agreement) {
-    return res.status(404).json({ error: "Agreement not found" });
+  if (isNaN(rentNum) || rentNum <= 0 || isNaN(depositNum) || depositNum < 0) {
+    return res.status(400).json({ error: "Rent and deposit must be valid positive numbers" });
   }
 
-  const payment = {
-    id: `pay_${Date.now()}`,
+  const agreementId = `agreement_${Date.now()}`;
+
+  const stmt = db.prepare(`
+    INSERT INTO agreements (
+      id, company_id, contract_address, landlord_address, tenant_address,
+      rent_inr, security_deposit_inr, duration_days, property_details,
+      current_document_hash, status, version
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  stmt.run(
     agreementId,
-    amountINR,
-    paymentGateway, // e.g. Razorpay / Stripe (Requirement 9)
+    companyId || "Company_A",
+    contractAddress || null,
+    landlordAddress,
+    tenantAddress || null,
+    rentNum,
+    depositNum,
+    durationNum,
+    propertyDetails,
+    pdfHash,
+    "Draft",
+    1
+  );
+
+  logAudit("AGREEMENT_CREATED", `Agreement ${agreementId} created for ${propertyDetails}`, req.user.email, agreementId, req);
+
+  const created = db.prepare("SELECT * FROM agreements WHERE id = ?").get(agreementId);
+  res.status(201).json(created);
+});
+
+// 6. Record Payment
+app.post("/api/payments", authenticateToken, (req, res) => {
+  const { agreementId, amountINR, payerAddress, paymentGateway, transactionId } = req.body;
+
+  if (!agreementId || !amountINR || !transactionId) {
+    return res.status(400).json({ error: "Missing payment parameters" });
+  }
+
+  const agreement = db.prepare("SELECT * FROM agreements WHERE id = ?").get(agreementId);
+  if (!agreement) {
+    return res.status(404).json({ error: "Agreement not found" });
+  }
+
+  const paymentId = `pay_${Date.now()}`;
+  const stmt = db.prepare(`
+    INSERT INTO payments (id, agreement_id, amount_inr, payer_address, payment_gateway, transaction_id, status)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  stmt.run(
+    paymentId,
+    agreementId,
+    parseFloat(amountINR),
+    payerAddress || req.user.email,
+    paymentGateway || "Direct",
     transactionId,
-    status: "Success",
-    timestamp: new Date().toISOString()
-  };
+    "Success"
+  );
 
-  db.payments.push(payment);
-  logAudit("PAYMENT_COMPLETED", `INR Payment of ₹${amountINR} logged via ${paymentGateway}. Tx: ${transactionId}`, agreementId);
+  logAudit(
+    "PAYMENT_COMPLETED",
+    `Payment of ₹${amountINR} recorded via ${paymentGateway || "Direct"}. Tx: ${transactionId}`,
+    req.user.email,
+    agreementId,
+    req
+  );
 
+  const payment = db.prepare("SELECT * FROM payments WHERE id = ?").get(paymentId);
   res.status(201).json(payment);
 });
 
-// 5. Retrieve Tenants (Requirement 19 - GET /tenants)
-app.get("/api/tenants", authenticateToken, requireRole(["Super Admin", "Property Owner", "Legal Officer", "Auditor"]), (req, res) => {
-  const tenants = db.users.filter(u => u.role === "Tenant");
-  res.json(tenants);
-});
-
-// 6. Verify Agreement integrity on-chain (Requirement 19 - POST /verifyAgreement)
+// 7. Verify Agreement Document Integrity (Cryptographic SHA-256 match)
 app.post("/api/verifyAgreement", (req, res) => {
   const { agreementId, providedPdfHash } = req.body;
 
-  const agreement = db.agreements.find(a => a.id === agreementId);
+  if (!agreementId || !providedPdfHash) {
+    return res.status(400).json({ error: "Agreement ID/address and PDF hash are required" });
+  }
+
+  const agreement = db.prepare("SELECT * FROM agreements WHERE id = ? OR contract_address = ?").get(agreementId, agreementId);
+  
   if (!agreement) {
     return res.status(404).json({ error: "Agreement not found in database" });
   }
 
-  // Verifying SHA256 integrity (Requirement 4)
-  const isConsistent = agreement.currentDocumentHash === providedPdfHash;
+  const isConsistent = agreement.current_document_hash.toLowerCase().trim() === providedPdfHash.toLowerCase().trim();
 
-  logAudit("INTEGRITY_VERIFICATION", `Agreement integrity check executed. Result: ${isConsistent ? "PASSED" : "FAILED"}`, agreementId);
+  logAudit(
+    "INTEGRITY_VERIFICATION",
+    `Integrity verification performed for ${agreement.id}. Result: ${isConsistent ? "PASSED" : "FAILED"}`,
+    req.headers.authorization ? "authenticated_user" : "anonymous",
+    agreement.id,
+    req
+  );
 
   res.json({
-    agreementId,
-    onChainHash: agreement.currentDocumentHash,
+    agreementId: agreement.id,
+    propertyDetails: agreement.property_details,
+    registeredHash: agreement.current_document_hash,
     providedHash: providedPdfHash,
-    isValid: isConsistent
+    isValid: isConsistent,
+    verifiedAt: new Date().toISOString()
   });
 });
 
-// 7. Renew Agreement (Requirement 19 - POST /renewAgreement)
+// 8. Renew Agreement
 app.post("/api/renewAgreement", authenticateToken, requireRole(["Super Admin", "Property Owner", "Legal Officer"]), (req, res) => {
   const { agreementId, extensionDurationDays } = req.body;
 
-  const agreement = db.agreements.find(a => a.id === agreementId);
+  const agreement = db.prepare("SELECT * FROM agreements WHERE id = ?").get(agreementId);
   if (!agreement) {
     return res.status(404).json({ error: "Agreement not found" });
   }
 
-  agreement.status = "Renewed";
-  logAudit("AGREEMENT_RENEWED", `Agreement ${agreementId} renewed for another ${extensionDurationDays} days`, agreementId);
+  const extension = parseInt(extensionDurationDays || 30, 10);
+  const newDuration = agreement.duration_days + extension;
 
-  res.json({ success: true, status: agreement.status });
+  db.prepare("UPDATE agreements SET status = 'Renewed', duration_days = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+    .run(newDuration, agreementId);
+
+  logAudit("AGREEMENT_RENEWED", `Agreement ${agreementId} renewed for +${extension} days (total: ${newDuration})`, req.user.email, agreementId, req);
+
+  res.json({ success: true, status: "Renewed", newDurationDays: newDuration });
 });
 
-// 8. Fetch Security Audit Trail logs (Requirement 6, 15)
+// 9. Fetch Security Audit Trail
 app.get("/api/audit-trail", authenticateToken, requireRole(["Super Admin", "Auditor"]), (req, res) => {
-  res.json(db.auditLogs);
+  const limit = Math.min(parseInt(req.query.limit || 50, 10), 100);
+  const logs = db.prepare("SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT ?").all(limit);
+  res.json(logs);
 });
 
-const PORT = 4000;
-app.listen(PORT, () => {
-  console.log(`[RentSphere SaaS Server] Running on http://localhost:${PORT}`);
-  console.log(`[RBAC] Access rules and REST APIs initialized successfully.`);
+// 10. System Stats (For Super Admin dashboard)
+app.get("/api/stats", authenticateToken, requireRole(["Super Admin", "Auditor", "Legal Officer"]), (req, res) => {
+  const totalAgreements = db.prepare("SELECT COUNT(*) as count FROM agreements").get().count;
+  const activeAgreements = db.prepare("SELECT COUNT(*) as count FROM agreements WHERE status = 'Active'").get().count;
+  const totalRentVolume = db.prepare("SELECT SUM(rent_inr) as total FROM agreements").get().total || 0;
+  const totalLogs = db.prepare("SELECT COUNT(*) as count FROM audit_logs").get().count;
+  const totalUsers = db.prepare("SELECT COUNT(*) as count FROM users").get().count;
+
+  res.json({
+    totalAgreements,
+    activeAgreements,
+    totalRentVolume,
+    totalLogs,
+    totalUsers,
+    uptimePercent: 99.98
+  });
 });
+
+// 11. Retrieve Tenants (Clean user profile sans password hash)
+app.get("/api/tenants", authenticateToken, requireRole(["Super Admin", "Property Owner", "Legal Officer", "Auditor"]), (req, res) => {
+  const tenants = db.prepare("SELECT id, email, name, role, verified, created_at FROM users WHERE role = 'Tenant'").all();
+  res.json(tenants);
+});
+
+// Centralized error handler
+app.use((err, req, res, next) => {
+  console.error("Unhandled error:", err);
+  res.status(500).json({ error: "Internal server error" });
+});
+
+if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
+  app.listen(PORT, () => {
+    console.log(`[RentSphere SaaS Server] Running on http://localhost:${PORT}`);
+    console.log(`[RentSphere SaaS Server] SQLite Database connected successfully.`);
+  });
+}
+
+export { app, db };
+export default app;

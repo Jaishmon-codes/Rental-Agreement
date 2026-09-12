@@ -3,8 +3,16 @@
   "version": "1.0.0",
   "main": "server.js",
   "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test test/*.test.js"
+  },
   "dependencies": {
-    "express": "^4.19.2",
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^4.21.2",
     "jsonwebtoken": "^9.0.2"
   }
 }
