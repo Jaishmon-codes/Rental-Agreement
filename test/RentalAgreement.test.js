@@ -136,27 +136,46 @@ describe("RentalAgreement System", function () {
         ).to.be.revertedWith("Not tenant");
       });
 
-      it("should prevent landlord from claiming rent too early", async function () {
-        await expect(
-          agreement.connect(landlord).claimRent()
-        ).to.be.revertedWith("Too early to claim");
-      });
-
-      it("should allow landlord to claim rent after 30 days", async function () {
-        // Increase time by 30 days + 1 second
-        await ethers.provider.send("evm_increaseTime", [30 * 24 * 60 * 60 + 1]);
-        await ethers.provider.send("evm_mine");
-
+      it("should allow landlord to claim initial month rent immediately upon tenant joining", async function () {
         const balanceBefore = await ethers.provider.getBalance(landlord.address);
         const claimTx = await agreement.connect(landlord).claimRent();
         const receipt = await claimTx.wait();
-
-        // Calculate gas used
         const gasUsed = receipt.gasUsed * receipt.gasPrice;
-
         const balanceAfter = await ethers.provider.getBalance(landlord.address);
-        
+
         expect(balanceAfter + gasUsed - balanceBefore).to.equal(rentAmount);
+        expect(await agreement.claimableRent()).to.equal(0n);
+        // Security deposit is untouched
+        expect(await agreement.getBalance()).to.equal(securityDeposit);
+      });
+
+      it("should prevent landlord from claiming when no rent is available", async function () {
+        // Claim the initial rent first
+        await (await agreement.connect(landlord).claimRent()).wait();
+
+        // Attempting to claim again should revert
+        await expect(
+          agreement.connect(landlord).claimRent()
+        ).to.be.revertedWith("No rent available to claim");
+      });
+
+      it("should allow landlord to claim rent after tenant pays next rent", async function () {
+        // First claim
+        await (await agreement.connect(landlord).claimRent()).wait();
+
+        // Tenant pays next rent
+        await (await agreement.connect(tenant).payNextRent({ value: rentAmount })).wait();
+        expect(await agreement.claimableRent()).to.equal(rentAmount);
+
+        // Landlord claims next rent
+        const balanceBefore = await ethers.provider.getBalance(landlord.address);
+        const claimTx = await agreement.connect(landlord).claimRent();
+        const receipt = await claimTx.wait();
+        const gasUsed = receipt.gasUsed * receipt.gasPrice;
+        const balanceAfter = await ethers.provider.getBalance(landlord.address);
+
+        expect(balanceAfter + gasUsed - balanceBefore).to.equal(rentAmount);
+        expect(await agreement.getBalance()).to.equal(securityDeposit);
       });
 
       it("should end agreement and refund tenant if property is OK", async function () {

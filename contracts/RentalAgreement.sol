@@ -15,6 +15,8 @@ contract RentalAgreement {
 
     uint public startTime;
     uint public lastRentPaid;
+    uint public rentPaidUntil;
+    uint public claimableRent;
 
     uint public duration;
     bool public active;
@@ -102,6 +104,8 @@ contract RentalAgreement {
         tenant = _tenantAddress;
         startTime = block.timestamp;
         lastRentPaid = block.timestamp;
+        rentPaidUntil = block.timestamp + 30 days;
+        claimableRent = rentAmount;
         active = true;
 
         // Register tenant association in factory
@@ -126,24 +130,24 @@ contract RentalAgreement {
     function _payNextRent(address _tenantAddress) internal {
         require(msg.value == rentAmount, "Wrong rent amount");
         
-        // For simple record keeping, we advance the rent payment ledger conceptually
-        // and emit an event.
-        emit RentPaid(_tenantAddress, msg.value, lastRentPaid + 30 days, block.timestamp);
-    }
-
-    // Landlord claims monthly rent
-    function claimRent() external onlyLandlord isActive nonReentrant {
-        require(
-            block.timestamp >= lastRentPaid + 30 days,
-            "Too early to claim"
-        );
-
+        rentPaidUntil += 30 days;
+        claimableRent += msg.value;
         lastRentPaid = block.timestamp;
 
-        (bool success, ) = landlord.call{value: rentAmount}("");
+        emit RentPaid(_tenantAddress, msg.value, rentPaidUntil, block.timestamp);
+    }
+
+    // Landlord claims available rent
+    function claimRent() external onlyLandlord nonReentrant {
+        require(claimableRent > 0, "No rent available to claim");
+
+        uint amountToClaim = claimableRent;
+        claimableRent = 0;
+
+        (bool success, ) = landlord.call{value: amountToClaim}("");
         require(success, "Rent transfer failed");
 
-        emit RentClaimed(landlord, rentAmount, block.timestamp);
+        emit RentClaimed(landlord, amountToClaim, block.timestamp);
     }
 
     // ---------------- END AGREEMENT ----------------
