@@ -12,11 +12,19 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || "enterprise_rent_sphere_production_secret_key_2026";
-const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
+const rawCorsOrigins = process.env.CORS_ORIGIN || "*";
+const allowedOrigins = rawCorsOrigins.split(",").map((s) => s.trim());
 
 // Configure CORS
 app.use(cors({
-  origin: CORS_ORIGIN,
+  origin: (origin, callback) => {
+    // Allow non-browser requests (like curl, postman) or matching origins
+    if (!origin || allowedOrigins.includes("*") || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`CORS policy violation: Origin ${origin} not allowed`));
+    }
+  },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "Origin", "X-Requested-With", "Accept"]
 }));
