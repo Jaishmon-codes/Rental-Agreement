@@ -1,0 +1,35 @@
+# Node dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Hardhat build artifacts & cache
+artifacts/
+cache/
+typechain/
+typechain-types/
+
+# Frontend build output
+dist/
+dist-ssr/
+*.local
+
+# Remix & IDE artifacts
+.states/
+.vscode/
+.idea/
+
+# Environment files
+.env
+.env*.local
+
+# Database
+*.sqlite
+*.sqlite-journal
+*.db
+*.db-journal
+
+# OS files
+Thumbs.db
+.DS_Store
