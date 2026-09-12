@@ -203,8 +203,70 @@ describe("RentalAgreement System", function () {
         expect(landlordBalanceAfter + gasUsed - landlordBalanceBefore).to.equal(securityDeposit);
       });
 
-      it("should allow auto-expiry after agreement duration ends", async function () {
-        // Increase time past duration (30 days)
+      it("should reject invalid rent payment amounts", async function () {
+        await expect(
+          agreement.connect(tenant).payNextRent({ value: ethers.parseEther("0.01") })
+        ).to.be.revertedWith("Wrong rent amount");
+
+        await expect(
+          agreement.connect(tenant).payNextRent({ value: rentAmount * 2n })
+        ).to.be.revertedWith("Wrong rent amount");
+      });
+
+      it("should enforce access control on landlord actions", async function () {
+        await expect(
+          agreement.connect(tenant).claimRent()
+        ).to.be.revertedWith("Not landlord");
+
+        await expect(
+          agreement.connect(other).claimRent()
+        ).to.be.revertedWith("Not landlord");
+
+        await expect(
+          agreement.connect(tenant).endAgreement(true)
+        ).to.be.revertedWith("Not landlord");
+      });
+
+      it("should prevent invalid state transitions on closed contracts", async function () {
+        // End the agreement first
+        await agreement.connect(landlord).endAgreement(true);
+
+        // Cannot pay rent on closed contract
+        await expect(
+          agreement.connect(tenant).payNextRent({ value: rentAmount })
+        ).to.be.revertedWith("Contract not active");
+
+        // Cannot end an already closed contract
+        await expect(
+          agreement.connect(landlord).endAgreement(true)
+        ).to.be.revertedWith("Contract not active");
+      });
+
+      it("should prevent premature auto-expiry before duration has elapsed", async function () {
+        // Only 10 days elapsed, duration is 30 days
+        await ethers.provider.send("evm_increaseTime", [10 * 24 * 60 * 60]);
+        await ethers.provider.send("evm_mine");
+
+        await expect(
+          agreement.autoExpire()
+        ).to.be.revertedWith("Still active");
+      });
+
+      it("should prevent auto-expiry on already closed agreement", async function () {
+        // End agreement first
+        await agreement.connect(landlord).endAgreement(true);
+
+        // Advance time past duration
+        await ethers.provider.send("evm_increaseTime", [35 * 24 * 60 * 60]);
+        await ethers.provider.send("evm_mine");
+
+        await expect(
+          agreement.autoExpire()
+        ).to.be.revertedWith("Already closed");
+      });
+
+      it("should allow auto-expiry and refund tenant after duration ends", async function () {
+        // Advance time past duration (30 days)
         await ethers.provider.send("evm_increaseTime", [30 * 24 * 60 * 60 + 1]);
         await ethers.provider.send("evm_mine");
 
