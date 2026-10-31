@@ -1,6 +1,6 @@
 {
   "name": "enterprise-rental-backend",
-  "version": "1.0.0",
+  "version": "1.0.0-beta",
   "main": "server.js",
   "type": "module",
   "scripts": {
@@ -13,6 +13,17 @@
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^4.21.2",
-    "jsonwebtoken": "^9.0.2"
+    "express-rate-limit": "^8.7.0",
+    "helmet": "^8.3.0",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^2.3.0",
+    "ethers": "^6.17.0"
+  },
+  "optionalDependencies": {
+    "@aws-sdk/client-s3": "^3.750.0",
+    "@aws-sdk/client-sqs": "^3.750.0"
+  },
+  "overrides": {
+    "qs": "^6.15.4"
   }
 }

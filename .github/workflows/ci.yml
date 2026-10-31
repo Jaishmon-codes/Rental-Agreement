@@ -1,0 +1,135 @@
+name: RentSphere Production CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, cleanup/production-ready ]
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smart-contracts:
+    name: Smart Contracts Build & Hardhat Security Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install Root Dependencies
+        run: npm ci
+
+      - name: Compile Contracts
+        run: npx hardhat compile
+
+      - name: Run Hardhat Test Suite (24 Escrow, Arbitrator & Invariant Tests)
+        run: npx hardhat test
+
+  backend-services:
+    name: Backend API & Micro-Engine Security Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js (v22 LTS with native node:sqlite)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Backend Dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Run Backend Regression Test Suites (115 Tests)
+        working-directory: backend
+        env:
+          NODE_ENV: test
+          JWT_SECRET: ci_test_jwt_secret_must_be_thirty_two_chars_long!
+        run: npm test
+
+  e2e-verification:
+    name: End-to-End Dual-Rail Verification Pass (7 Stages)
+    needs: [smart-contracts, backend-services]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Root Dependencies
+        run: npm ci
+
+      - name: Install Backend Dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Run 7-Stage Dual-Rail E2E Verification Pass
+        env:
+          NODE_ENV: test
+          JWT_SECRET: ci_test_jwt_secret_must_be_thirty_two_chars_long!
+        run: npx hardhat run scripts/verify_e2e.js
+
+  frontend-build:
+    name: Frontend Lint & Production Vite Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Frontend Dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Run Frontend Linter (Oxlint)
+        working-directory: frontend
+        run: npm run lint
+
+      - name: Build Frontend Production Artifacts
+        working-directory: frontend
+        run: npm run build
+
+  security-audit:
+    name: Dependency & Secret Hygiene Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Audit Backend Production Dependencies
+        working-directory: backend
+        run: npm audit --omit=dev
+
+      - name: Audit Frontend Production Dependencies
+        working-directory: frontend
+        run: npm audit --omit=dev
+
+      - name: Verify No Tracked .env Secret Files
+        run: |
+          if git ls-files | grep -E "(^|/)\.env$"; then
+            echo "ERROR: Tracked .env file detected in repository!"
+            exit 1
+          fi
+          echo "Secret scan passed: No .env files tracked."

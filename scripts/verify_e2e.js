@@ -2,6 +2,7 @@ import pkg from "hardhat";
 const { ethers } = pkg;
 import { createHash } from "node:crypto";
 import { app, db } from "../backend/server.js";
+import { RAZORPAY_KEY_SECRET } from "../backend/services/payment/razorpay.js";
 
 async function main() {
   console.log("=================================================");
@@ -181,6 +182,85 @@ async function main() {
 
     if (!fetchedBefore) throw new Error("Persistence verification failed!");
     console.log("[PERSISTENCE] PASSED: Data written to persistent SQLite storage.");
+
+    // 7. FIAT PAYMENT RAIL: RAZORPAY ORDER, SIGNATURE VERIFY, SETTLEMENT & RECONCILIATION
+    console.log("\n--- 7. FIAT PAYMENT RAIL (RAZORPAY) VERIFICATION ---");
+    // Assign tenant to agreement in db
+    db.prepare("UPDATE agreements SET tenant_address = 'tenant@gmail.com', landlord_address = 'landlord@gmail.com', status = 'Active' WHERE id = ?").run(testAgreementId);
+    
+    // Register landlord linked account
+    const landlordLoginRes = await fetch(`${base}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "landlord@gmail.com", password: "Password@123" })
+    });
+    const landlordToken = (await landlordLoginRes.json()).token;
+
+    await fetch(`${base}/api/landlords/linked-account`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${landlordToken}` },
+      body: JSON.stringify({
+        accountNumber: "987654321012",
+        ifscCode: "HDFC0001234",
+        beneficiaryName: "DLF Properties Ltd"
+      })
+    });
+    console.log("[RAZORPAY ROUTE] Landlord linked account registered successfully");
+
+    // Tenant creates payment order
+    const orderRes = await fetch(`${base}/api/payments/create-order`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${tenantToken}` },
+      body: JSON.stringify({ agreementId: testAgreementId, paymentType: "RENT" })
+    });
+    const orderData = await orderRes.json();
+    console.log(`[RAZORPAY ORDER] Created Order ID: ${orderData.orderId}, Amount: ₹${orderData.amountRupees}, Platform Fee (3%): ₹${orderData.feeDetails?.platformFeeRupees}`);
+    if (orderRes.status !== 201 || !orderData.orderId) throw new Error("Order creation failed!");
+
+    // Generate valid HMAC-SHA256 signature
+    const paymentTxId = `pay_e2e_${Date.now()}`;
+    const cryptoModule = await import("node:crypto");
+    const hmacSignature = cryptoModule.createHmac("sha256", RAZORPAY_KEY_SECRET)
+      .update(`${orderData.orderId}|${paymentTxId}`)
+      .digest("hex");
+
+    // Verify & Capture payment
+    const verifyRes = await fetch(`${base}/api/payments/verify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${tenantToken}` },
+      body: JSON.stringify({
+        paymentId: orderData.paymentId,
+        razorpayPaymentId: paymentTxId,
+        razorpayOrderId: orderData.orderId,
+        razorpaySignature: hmacSignature
+      })
+    });
+    const verifyData = await verifyRes.json();
+    console.log(`[PAYMENT CAPTURED] Status: ${verifyData.status}, Net to Landlord: ₹${verifyData.landlordAllocationRupees}`);
+    if (verifyRes.status !== 200 || verifyData.status !== "CAPTURED") {
+      throw new Error("Payment capture verification failed!");
+    }
+
+    // Finance Admin audits reconciliation
+    const finLoginRes = await fetch(`${base}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "finance@rentsphere.com", password: "Password@123" })
+    });
+    const finToken = (await finLoginRes.json()).token;
+
+    const reconRes = await fetch(`${base}/api/payments/reconciliation`, {
+      headers: { Authorization: `Bearer ${finToken}` }
+    });
+    const reconData = await reconRes.json();
+    console.log(`[RECONCILIATION] Audited: ${reconData.totalPaymentsAudited}, Summary:`, reconData.summary);
+    if (reconData.discrepancies.length > 0) {
+      console.log("[RECONCILIATION] Non-matched items:", reconData.discrepancies);
+    }
+    if (reconRes.status !== 200 || reconData.summary?.mismatch > 0 || reconData.summary?.manualReview > 0) {
+      throw new Error("Reconciliation detected severe ledger mismatches!");
+    }
+    console.log("[FIAT RAIL] PASSED: Razorpay order, signature capture, fee split, settlement & reconciliation verified.");
 
   } finally {
     server.close();

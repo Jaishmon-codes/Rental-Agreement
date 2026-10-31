@@ -3,8 +3,12 @@ import { ethers } from "ethers";
 import Navbar from "./components/Navbar.jsx";
 import LandlordPanel from "./components/LandlordPanel.jsx";
 import TenantPanel from "./components/TenantPanel.jsx";
+import PropertiesPanel from "./components/PropertiesPanel.jsx";
+import DocumentsPanel from "./components/DocumentsPanel.jsx";
 import ExplorePanel from "./components/ExplorePanel.jsx";
 import EnterprisePanel from "./components/EnterprisePanel.jsx";
+import AuthModal from "./components/AuthModal.jsx";
+import WalletOnboardingModal from "./components/WalletOnboardingModal.jsx";
 import TxModal from "./components/TxModal.jsx";
 import {
   connectWeb3,
@@ -14,10 +18,9 @@ import {
   getAgreementContract
 } from "./services/web3.js";
 import api, { getToken } from "./services/api.js";
-import { Building, Wallet } from "lucide-react";
 
 function App() {
-  // Web3 Wallet state
+  // Web3 Wallet state (Optional decoupled identity)
   const [provider, setProvider] = useState(null);
   const [signer, setSigner] = useState(null);
   const [account, setAccount] = useState("");
@@ -25,13 +28,19 @@ function App() {
   const [networkName, setNetworkName] = useState("");
   const [isCorrectNetwork, setIsCorrectNetwork] = useState(true);
 
+  // User Authentication state
+  const [currentUser, setCurrentUser] = useState(null);
+  const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
+  const [isWalletModalOpen, setIsWalletModalOpen] = useState(false);
+
   // App navigation
-  const [activeTab, setActiveTab] = useState("landlord");
+  const [activeTab, setActiveTab] = useState("properties");
   const [loading, setLoading] = useState(false);
 
   // Agreements state
   const [landlordAgreements, setLandlordAgreements] = useState([]);
   const [tenantAgreements, setTenantAgreements] = useState([]);
+  const [backendAgreements, setBackendAgreements] = useState([]);
 
   // Universal explorer state
   const [exploreDetails, setExploreDetails] = useState(null);
@@ -54,6 +63,37 @@ function App() {
     setTxStatus((prev) => ({ ...prev, show: false }));
   };
 
+  // Load user profile on mount if token is saved
+  useEffect(() => {
+    if (getToken()) {
+      api.getProfile()
+        .then((profile) => {
+          setCurrentUser(profile);
+          if (profile.role === "Property Owner") setActiveTab("properties");
+          else if (profile.role === "Tenant") setActiveTab("properties");
+          else if (["Super Admin", "Finance Admin", "Auditor", "Legal Officer"].includes(profile.role)) setActiveTab("enterprise");
+        })
+        .catch(() => {
+          api.logout();
+          setCurrentUser(null);
+        });
+    }
+  }, []);
+
+  // Fetch backend agreements
+  const loadBackendAgreements = useCallback(async () => {
+    try {
+      const list = await api.getAgreements();
+      setBackendAgreements(list || []);
+    } catch (err) {
+      console.error("Failed to load backend agreements:", err);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadBackendAgreements();
+  }, [currentUser, loadBackendAgreements]);
+
   // Connect Wallet
   const handleConnectWallet = async () => {
     try {
@@ -66,10 +106,12 @@ function App() {
       setNetworkName(web3.networkName);
       setIsCorrectNetwork(web3.isCorrectNetwork);
       setLoading(false);
+      return web3;
     } catch (err) {
       console.error(err);
       setLoading(false);
       showTx("error", "Wallet Connection Failed", err.message);
+      return null;
     }
   };
 
@@ -84,7 +126,10 @@ function App() {
 
   // Refresh and load on-chain agreements
   const loadAgreements = useCallback(async () => {
-    if (!provider || !account || !isCorrectNetwork) return;
+    if (!provider || !account || !isCorrectNetwork) {
+      loadBackendAgreements();
+      return;
+    }
 
     try {
       setLoading(true);
@@ -100,12 +145,13 @@ function App() {
 
       setLandlordAgreements(landlordData.filter(Boolean));
       setTenantAgreements(tenantData.filter(Boolean));
+      loadBackendAgreements();
       setLoading(false);
     } catch (err) {
-      console.error("Error loading agreements:", err);
+      console.error("Error loading on-chain agreements:", err);
       setLoading(false);
     }
-  }, [provider, account, isCorrectNetwork]);
+  }, [provider, account, isCorrectNetwork, loadBackendAgreements]);
 
   useEffect(() => {
     if (account && provider && isCorrectNetwork) {
@@ -118,6 +164,7 @@ function App() {
     if (window.ethereum) {
       const handleAccountsChanged = (accounts) => {
         if (accounts.length > 0) {
+          setAccount(accounts[0]);
           handleConnectWallet();
         } else {
           setAccount("");
@@ -140,113 +187,133 @@ function App() {
     }
   }, []);
 
-  // Deploy New Smart Lease
+  // Create Lease (Landlord)
   const handleCreateLease = async ({ propertyAddress, rentEth, depositEth, durationDays, documentHash }) => {
-    if (!signer) return;
+    if (!signer) {
+      setIsWalletModalOpen(true);
+      return;
+    }
 
     try {
-      showTx("pending", "Initiating Deployment", "Broadcasting new rental agreement deployment transaction...");
-
+      showTx("pending", "Deploying Agreement", "Waiting for MetaMask confirmation...");
       const factory = getFactoryContract(signer);
+
       const rentWei = ethers.parseEther(rentEth.toString());
       const depositWei = ethers.parseEther(depositEth.toString());
-      const duration = BigInt(durationDays);
+      const durationSecs = parseInt(durationDays, 10) * 86400;
 
       const tx = await factory.createAgreement(
         rentWei,
         depositWei,
-        duration,
+        durationSecs,
         propertyAddress,
         documentHash
       );
 
-      showTx("pending", "Confirming Deployment", "Awaiting block confirmation on the blockchain...", tx.hash);
+      showTx("pending", "Confirming Deployment", "Awaiting transaction confirmation on blockchain...", tx.hash);
       const receipt = await tx.wait();
 
-      // Parse deployed address from log
-      let deployedAddr = "";
-      const eventLog = receipt.logs.find(
-        (log) => factory.interface.parseLog(log)?.name === "AgreementCreated"
-      );
-      if (eventLog) {
-        deployedAddr = factory.interface.parseLog(eventLog).args.agreementAddress;
+      let newContractAddress = "";
+      for (const log of receipt.logs) {
+        try {
+          const parsed = factory.interface.parseLog(log);
+          if (parsed && parsed.name === "AgreementCreated") {
+            newContractAddress = parsed.args.agreementContract;
+            break;
+          }
+        } catch {
+          // Log not from factory
+        }
       }
 
-      // Sync metadata with backend if available
-      if (getToken()) {
+      // Also record in backend database
+      try {
         await api.createAgreement({
-          companyId: "Company_A",
-          contractAddress: deployedAddr,
-          landlordAddress: account,
+          contractAddress: newContractAddress,
+          landlordAddress: account || currentUser?.email || "landlord@gmail.com",
           rentInINR: Math.round(parseFloat(rentEth) * 250000),
           securityDepositInINR: Math.round(parseFloat(depositEth) * 250000),
           durationDays: parseInt(durationDays, 10),
           propertyDetails: propertyAddress,
           pdfHash: documentHash
-        }).catch((err) => console.warn("Backend sync failed:", err.message));
+        });
+      } catch (dbErr) {
+        console.warn("Backend sync notice:", dbErr.message);
       }
 
-      showTx("success", "Smart Lease Deployed", "Your rental agreement contract is active on-chain.", tx.hash);
+      showTx(
+        "success",
+        "Agreement Deployed Successfully",
+        `Contract live at: ${newContractAddress || "Confirmed"}`,
+        tx.hash
+      );
+
       loadAgreements();
     } catch (err) {
       console.error(err);
-      showTx("error", "Deployment Failed", err.reason || err.message || "Failed to deploy contract.");
-    }
-  };
-
-  // Join Lease as Tenant
-  const handleJoinLease = async (agreementAddress, rentAmount, securityDeposit) => {
-    if (!signer) return;
-
-    try {
-      showTx("pending", "Depositing Funds", "Sending first month's rent and security deposit into escrow...");
-
-      const contract = getAgreementContract(agreementAddress, signer);
-      const totalAmount = rentAmount + securityDeposit;
-
-      const tx = await contract.joinAsTenant({ value: totalAmount });
-      showTx("pending", "Processing Transaction", "Awaiting block confirmation...", tx.hash);
-      await tx.wait();
-
-      showTx("success", "Lease Successfully Signed", "You have signed the lease and deposited funds into escrow.", tx.hash);
-      loadAgreements();
-      handleExploreContract(agreementAddress);
-    } catch (err) {
-      console.error(err);
-      showTx("error", "Failed to Join Lease", err.reason || err.message || "Could not complete lease signature.");
+      showTx("error", "Deployment Failed", err.reason || err.message || "Unknown blockchain error");
     }
   };
 
   // Claim Rent (Landlord)
   const handleClaimRent = async (agreementAddress) => {
-    if (!signer) return;
+    if (!signer) {
+      setIsWalletModalOpen(true);
+      return;
+    }
 
     try {
-      showTx("pending", "Claiming Rent", "Withdrawing available rent balance from contract vault...");
-
+      showTx("pending", "Claiming Rent", "Submitting rent claim request...");
       const contract = getAgreementContract(agreementAddress, signer);
       const tx = await contract.claimRent();
-      showTx("pending", "Withdrawing Funds", "Transferring rent to your wallet address...", tx.hash);
+      showTx("pending", "Settling Balances", "Awaiting block confirmation...", tx.hash);
       await tx.wait();
 
-      showTx("success", "Rent Claimed Successfully", "Rent has been transferred to your wallet.", tx.hash);
+      showTx("success", "Rent Claimed Successfully", "Rent has been transferred directly to your wallet.", tx.hash);
       loadAgreements();
       if (exploreDetails?.address === agreementAddress) {
         handleExploreContract(agreementAddress);
       }
     } catch (err) {
       console.error(err);
-      showTx("error", "Claim Failed", err.reason || err.message || "No rent available to claim.");
+      showTx("error", "Claim Failed", err.reason || err.message || "Failed to claim rent.");
     }
   };
 
-  // Pay Next Month Rent (Tenant)
-  const handlePayRent = async (agreementAddress, rentAmount) => {
-    if (!signer) return;
+  // Join Lease (Tenant)
+  const handleJoinLease = async (agreementAddress, totalRequiredWei) => {
+    if (!signer) {
+      setIsWalletModalOpen(true);
+      return;
+    }
 
     try {
-      showTx("pending", "Paying Monthly Rent", "Sending rent payment to the agreement vault...");
+      showTx("pending", "Signing Lease", "Locking security deposit & first month rent in escrow...");
+      const contract = getAgreementContract(agreementAddress, signer);
+      const tx = await contract.joinAgreement({ value: totalRequiredWei });
+      showTx("pending", "Confirming Lease", "Awaiting block confirmation...", tx.hash);
+      await tx.wait();
 
+      showTx("success", "Lease Signed & Active", "You are now the active tenant for this property.", tx.hash);
+      loadAgreements();
+      if (exploreDetails?.address === agreementAddress) {
+        handleExploreContract(agreementAddress);
+      }
+    } catch (err) {
+      console.error(err);
+      showTx("error", "Signing Failed", err.reason || err.message || "Could not join lease.");
+    }
+  };
+
+  // Pay Monthly Rent (Tenant - On Chain)
+  const handlePayRent = async (agreementAddress, rentAmount) => {
+    if (!signer) {
+      setIsWalletModalOpen(true);
+      return;
+    }
+
+    try {
+      showTx("pending", "Paying Monthly Rent", "Transferring rent to agreement balance...");
       const contract = getAgreementContract(agreementAddress, signer);
       const tx = await contract.payNextRent({ value: rentAmount });
       showTx("pending", "Processing Payment", "Awaiting confirmation on the blockchain...", tx.hash);
@@ -265,7 +332,10 @@ function App() {
 
   // End Agreement (Landlord)
   const handleEndLease = async (agreementAddress, propertyOk) => {
-    if (!signer) return;
+    if (!signer) {
+      setIsWalletModalOpen(true);
+      return;
+    }
 
     try {
       const actionText = propertyOk ? "Refund Security Deposit" : "Forfeit Security Deposit";
@@ -289,7 +359,10 @@ function App() {
 
   // Auto-Expire (Tenant / Anyone after duration)
   const handleTriggerExpiry = async (agreementAddress) => {
-    if (!signer) return;
+    if (!signer) {
+      setIsWalletModalOpen(true);
+      return;
+    }
 
     try {
       showTx("pending", "Executing Lease Expiry", "Deactivating contract and executing automated deposit refund...");
@@ -333,10 +406,46 @@ function App() {
     }
   };
 
+  const handleLogout = () => {
+    api.logout();
+    setCurrentUser(null);
+    setActiveTab("properties");
+  };
+
+  // Combine on-chain and backend agreements for document vault
+  const allAgreements = [
+    ...landlordAgreements.map(a => ({ ...a, id: a.address })),
+    ...tenantAgreements.map(a => ({ ...a, id: a.address })),
+    ...backendAgreements
+  ];
+
   return (
     <div className="app-container">
-      {/* Transaction Modal */}
+      {/* Modals */}
       <TxModal txStatus={txStatus} onClose={closeTx} />
+      
+      <AuthModal
+        isOpen={isAuthModalOpen}
+        onClose={() => setIsAuthModalOpen(false)}
+        onAuthSuccess={(user) => {
+          setCurrentUser(user);
+          loadBackendAgreements();
+        }}
+      />
+
+      <WalletOnboardingModal
+        isOpen={isWalletModalOpen}
+        onClose={() => setIsWalletModalOpen(false)}
+        currentUser={currentUser}
+        onWalletLinked={(web3) => {
+          setProvider(web3.provider);
+          setSigner(web3.signer);
+          setAccount(web3.account);
+          setBalance(web3.balance);
+          setNetworkName(web3.networkName);
+          setIsCorrectNetwork(web3.isCorrectNetwork);
+        }}
+      />
 
       {/* Navbar */}
       <Navbar
@@ -349,86 +458,68 @@ function App() {
         onConnect={handleConnectWallet}
         onSwitchNetwork={handleSwitchNetwork}
         loading={loading}
+        currentUser={currentUser}
+        onOpenAuth={() => setIsAuthModalOpen(true)}
+        onLogout={handleLogout}
+        onOpenWalletModal={() => setIsWalletModalOpen(true)}
       />
 
-      {/* Main Content */}
-      {!account && activeTab !== "explore" && activeTab !== "enterprise" ? (
-        <main className="glass-panel" style={{ padding: "4rem 2rem", textAlign: "center", display: "flex", flexDirection: "column", alignItems: "center", gap: "1.5rem" }}>
-          <div style={{
-            background: "linear-gradient(135deg, rgba(0,242,254,0.1), rgba(155,81,224,0.1))",
-            border: "1px solid var(--border-glow)",
-            borderRadius: "50%",
-            padding: "2rem",
-            color: "var(--accent-cyan)"
-          }}>
-            <Building size={64} />
-          </div>
-          <h1 style={{
-            fontSize: "2.5rem",
-            margin: 0,
-            background: "linear-gradient(135deg, #fff, #94a3b8)",
-            WebkitBackgroundClip: "text",
-            WebkitTextFillColor: "transparent"
-          }}>
-            Decentralized Smart Leases
-          </h1>
-          <p style={{ maxWidth: "600px", color: "var(--text-secondary)", margin: 0, lineHeight: 1.6 }}>
-            Sign, deploy, pay, and settle rental agreements securely using cryptographically enforced Ethereum smart contracts.
-            Automate monthly rent, isolate security deposits in escrow, and authenticate physical lease documents using real-time SHA-256 verification.
-          </p>
-          <div style={{ display: "flex", gap: "1rem", marginTop: "1rem" }}>
-            <button className="btn-primary" onClick={handleConnectWallet} style={{ fontSize: "1rem", padding: "0.85rem 1.75rem" }}>
-              <Wallet size={18} />
-              Connect Web3 Wallet
-            </button>
-            <button className="btn-outline" onClick={() => setActiveTab("explore")} style={{ fontSize: "1rem", padding: "0.85rem 1.75rem" }}>
-              Explore Public Contracts
-            </button>
-          </div>
-        </main>
-      ) : (
-        <main>
-          {activeTab === "landlord" && (
-            <LandlordPanel
-              agreements={landlordAgreements}
-              onCreateLease={handleCreateLease}
-              onClaimRent={handleClaimRent}
-              onEndLease={handleEndLease}
-              onRefresh={loadAgreements}
-              loading={loading}
-              isCorrectNetwork={isCorrectNetwork}
-            />
-          )}
+      {/* Main SaaS Content Panels */}
+      <main>
+        {activeTab === "properties" && (
+          <PropertiesPanel
+            currentUser={currentUser}
+            onDraftAgreementForUnit={() => setActiveTab("landlord")}
+          />
+        )}
 
-          {activeTab === "tenant" && (
-            <TenantPanel
-              agreements={tenantAgreements}
-              account={account}
-              onJoinLease={handleJoinLease}
-              onPayRent={handlePayRent}
-              onTriggerExpiry={handleTriggerExpiry}
-              onRefresh={loadAgreements}
-              onExploreContract={handleExploreContract}
-              exploreDetails={exploreDetails}
-              exploreError={exploreError}
-              loading={loading}
-            />
-          )}
+        {activeTab === "landlord" && (
+          <LandlordPanel
+            agreements={landlordAgreements}
+            onCreateLease={handleCreateLease}
+            onClaimRent={handleClaimRent}
+            onEndLease={handleEndLease}
+            onRefresh={loadAgreements}
+            loading={loading}
+            isCorrectNetwork={isCorrectNetwork}
+          />
+        )}
 
-          {activeTab === "explore" && (
-            <ExplorePanel
-              onExplore={handleExploreContract}
-              exploreDetails={exploreDetails}
-              exploreError={exploreError}
-              loading={loading}
-            />
-          )}
+        {activeTab === "tenant" && (
+          <TenantPanel
+            agreements={tenantAgreements}
+            account={account}
+            onJoinLease={handleJoinLease}
+            onPayRent={handlePayRent}
+            onTriggerExpiry={handleTriggerExpiry}
+            onRefresh={loadAgreements}
+            onExploreContract={handleExploreContract}
+            exploreDetails={exploreDetails}
+            exploreError={exploreError}
+            loading={loading}
+          />
+        )}
 
-          {activeTab === "enterprise" && (
-            <EnterprisePanel />
-          )}
-        </main>
-      )}
+        {activeTab === "documents" && (
+          <DocumentsPanel
+            currentUser={currentUser}
+            agreements={allAgreements.length > 0 ? allAgreements : [{ id: "agreement_001", property_details: "742 Evergreen Terrace" }]}
+          />
+        )}
+
+        {activeTab === "explore" && (
+          <ExplorePanel
+            onExplore={handleExploreContract}
+            exploreDetails={exploreDetails}
+            exploreError={exploreError}
+            loading={loading}
+          />
+        )}
+
+        {activeTab === "enterprise" && (
+          <EnterprisePanel />
+        )}
+      </main>
     </div>
   );
 }

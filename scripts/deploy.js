@@ -5,22 +5,14 @@ async function main() {
   const [deployer] = await ethers.getSigners();
   console.log("Deploying contracts with the account:", deployer.address);
 
-  // 1. Deploy RentalAgreementFactory (Option A / Single Leases)
+  // 1. Deploy RentalAgreementFactory
   const Factory = await ethers.getContractFactory("RentalAgreementFactory");
   const factory = await Factory.deploy();
   await factory.waitForDeployment();
   const factoryAddress = await factory.getAddress();
   console.log("RentalAgreementFactory deployed to:", factoryAddress);
 
-  // 2. Deploy MultiTenantRentalPlatform (SaaS / Enterprise ledger)
-  console.log("Deploying MultiTenantRentalPlatform...");
-  const Platform = await ethers.getContractFactory("MultiTenantRentalPlatform");
-  const platform = await Platform.deploy();
-  await platform.waitForDeployment();
-  const platformAddress = await platform.getAddress();
-  console.log("MultiTenantRentalPlatform deployed to:", platformAddress);
-
-  // Deploy a sample agreement for testing Option A
+  // Deploy a sample agreement for testing
   const rentAmount = ethers.parseEther("0.05"); // 0.05 ETH
   const securityDeposit = ethers.parseEther("0.1"); // 0.1 ETH
   const durationInDays = 30;
@@ -47,7 +39,6 @@ async function main() {
   import("node:fs").then(({ writeFileSync }) => {
     const content = `export const CONTRACT_ADDRESSES = {
   RentalAgreementFactory: "${factoryAddress}",
-  MultiTenantRentalPlatform: "${platformAddress}",
   SampleAgreement: "${sampleAgreementAddress}"
 };
 `;

@@ -1,7 +1,8 @@
 import React, { useState } from "react";
 import { ethers } from "ethers";
-import { Search, User, RefreshCw, CheckCircle } from "lucide-react";
+import { Search, User, RefreshCw, CheckCircle, CreditCard, FileText, CheckCircle2, X } from "lucide-react";
 import { formatShortAddress } from "../utils/crypto.js";
+import api, { getToken } from "../services/api.js";
 
 export default function TenantPanel({
   agreements,
@@ -16,11 +17,95 @@ export default function TenantPanel({
   loading
 }) {
   const [searchAddr, setSearchAddr] = useState("");
+  const [fiatOrder, setFiatOrder] = useState(null);
+  const [receipt, setReceipt] = useState(null);
+  const [paymentLoading, setPaymentLoading] = useState(false);
 
   const handleSearch = (e) => {
     e.preventDefault();
     if (searchAddr.trim()) {
       onExploreContract(searchAddr.trim());
+    }
+  };
+
+  const handleInitiateRazorpay = async (agreementAddress) => {
+    if (!getToken()) {
+      alert("Please log in to the Enterprise / Tenant portal (Enterprise Tab) first to authorize fiat payments.");
+      return;
+    }
+    setPaymentLoading(true);
+    try {
+      const order = await api.createPaymentOrder(agreementAddress);
+      setFiatOrder(order);
+      setPaymentLoading(false);
+    } catch (err) {
+      alert("Failed to initialize Razorpay payment order: " + err.message);
+      setPaymentLoading(false);
+    }
+  };
+
+  const handleCompleteRazorpayPayment = async () => {
+    if (!fiatOrder) return;
+    setPaymentLoading(true);
+    try {
+      if (typeof window !== "undefined" && !window.Razorpay) {
+        await new Promise((resolve, reject) => {
+          const script = document.createElement("script");
+          script.src = "https://checkout.razorpay.com/v1/checkout.js";
+          script.async = true;
+          script.onload = resolve;
+          script.onerror = () => reject(new Error("Unable to load Razorpay checkout script. Ensure internet connectivity."));
+          document.body.appendChild(script);
+        }).catch((e) => {
+          console.warn("Razorpay script load error:", e);
+        });
+      }
+
+      if (window.Razorpay) {
+        const options = {
+          key: fiatOrder.keyId,
+          amount: fiatOrder.amount || fiatOrder.amountPaise,
+          currency: fiatOrder.currency || "INR",
+          name: "RentSphere Rent Payment",
+          description: `Rent payment for agreement ${fiatOrder.agreementId}`,
+          order_id: fiatOrder.orderId,
+          handler: async (response) => {
+            try {
+              const receiptData = await api.verifyPayment({
+                razorpayOrderId: response.razorpay_order_id,
+                razorpayPaymentId: response.razorpay_payment_id,
+                razorpaySignature: response.razorpay_signature
+              });
+              setFiatOrder(null);
+              setReceipt(receiptData);
+              setPaymentLoading(false);
+              onRefresh();
+            } catch (vErr) {
+              alert("Payment verification failed: " + vErr.message);
+              setPaymentLoading(false);
+            }
+          },
+          modal: {
+            ondismiss: () => {
+              setPaymentLoading(false);
+            }
+          },
+          prefill: {
+            email: account
+          },
+          theme: {
+            color: "#6366f1"
+          }
+        };
+        const rzp = new window.Razorpay(options);
+        rzp.open();
+      } else {
+        alert("Razorpay Checkout SDK is not available. Please verify network connectivity or payment gateway configuration.");
+        setPaymentLoading(false);
+      }
+    } catch (err) {
+      alert("Payment initiation failed: " + err.message);
+      setPaymentLoading(false);
     }
   };
 
@@ -210,23 +295,34 @@ export default function TenantPanel({
                     </div>
                   </div>
 
-                  <div className="card-actions">
+                  <div className="card-actions" style={{ flexDirection: "column", gap: "0.5rem" }}>
                     {agreement.active ? (
                       <>
-                        <button
-                          className="btn-primary"
-                          style={{ flex: 1, fontSize: "0.85rem", justifyContent: "center" }}
-                          onClick={() => onPayRent(agreement.address, agreement.rentAmount)}
-                          disabled={loading}
-                        >
-                          Pay Rent ({ethers.formatEther(agreement.rentAmount)} ETH)
-                        </button>
+                        <div style={{ display: "flex", gap: "0.5rem", width: "100%" }}>
+                          <button
+                            className="btn-primary"
+                            style={{ flex: 1, fontSize: "0.85rem", justifyContent: "center", background: "linear-gradient(135deg, #0d9488 0%, #059669 100%)" }}
+                            onClick={() => handleInitiateRazorpay(agreement.address)}
+                            disabled={loading || paymentLoading}
+                          >
+                            <CreditCard size={15} />
+                            Pay Rent via Razorpay (INR)
+                          </button>
+                          <button
+                            className="btn-outline"
+                            style={{ flex: 1, fontSize: "0.85rem", justifyContent: "center" }}
+                            onClick={() => onPayRent(agreement.address, agreement.rentAmount)}
+                            disabled={loading || paymentLoading}
+                          >
+                            Pay on Ethereum ({ethers.formatEther(agreement.rentAmount)} ETH)
+                          </button>
+                        </div>
                         {isExpired && (
                           <button
                             className="btn-outline"
-                            style={{ flex: 1, fontSize: "0.85rem", justifyContent: "center", borderColor: "var(--accent-amber)", color: "var(--accent-amber)" }}
+                            style={{ width: "100%", fontSize: "0.85rem", justifyContent: "center", borderColor: "var(--accent-amber)", color: "var(--accent-amber)" }}
                             onClick={() => onTriggerExpiry(agreement.address)}
-                            disabled={loading}
+                            disabled={loading || paymentLoading}
                           >
                             Trigger Expiry & Refund
                           </button>
@@ -244,6 +340,133 @@ export default function TenantPanel({
           </div>
         )}
       </div>
+
+      {/* Razorpay Checkout & Fee Breakdown Modal */}
+      {fiatOrder && (
+        <div className="modal-backdrop">
+          <div className="glass-panel modal-card" style={{ maxWidth: "480px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1.25rem" }}>
+              <h3 style={{ margin: 0, display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                <CreditCard size={20} style={{ color: "var(--accent-cyan)" }} />
+                Razorpay Rent Checkout
+              </h3>
+              <button
+                className="btn-outline"
+                style={{ padding: "0.25rem 0.5rem", border: "none" }}
+                onClick={() => setFiatOrder(null)}
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <div style={{ background: "rgba(0,0,0,0.2)", padding: "1rem", borderRadius: "8px", marginBottom: "1.25rem" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "0.5rem", fontSize: "0.9rem" }}>
+                <span style={{ color: "var(--text-muted)" }}>Property:</span>
+                <span style={{ fontWeight: 600 }}>{fiatOrder.propertyDetails || "Cyber City Tower B"}</span>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "0.5rem", fontSize: "0.9rem" }}>
+                <span style={{ color: "var(--text-muted)" }}>Total Rent Due (Tenant Pays):</span>
+                <span style={{ fontWeight: 700, color: "var(--accent-cyan)", fontSize: "1.1rem" }}>
+                  ₹{fiatOrder.feeDetails.grossRupees.toLocaleString("en-IN")}
+                </span>
+              </div>
+              <hr style={{ borderColor: "rgba(255,255,255,0.08)", margin: "0.75rem 0" }} />
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "0.35rem", fontSize: "0.8rem" }}>
+                <span style={{ color: "var(--text-muted)" }}>RentSphere Fee (3% - Landlord Bearing):</span>
+                <span>- ₹{fiatOrder.feeDetails.platformFeeRupees.toLocaleString("en-IN")}</span>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.8rem" }}>
+                <span style={{ color: "var(--text-muted)" }}>Net Landlord Allocation:</span>
+                <span style={{ color: "var(--accent-emerald)", fontWeight: 600 }}>
+                  ₹{fiatOrder.feeDetails.landlordRupees.toLocaleString("en-IN")}
+                </span>
+              </div>
+            </div>
+
+            <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginBottom: "1.25rem" }}>
+              Razorpay Order ID: <code style={{ color: "var(--accent-purple)" }}>{fiatOrder.orderId}</code>
+            </div>
+
+            <button
+              className="btn-primary"
+              style={{ width: "100%", justifyContent: "center", padding: "0.75rem" }}
+              onClick={handleCompleteRazorpayPayment}
+              disabled={paymentLoading}
+            >
+              {paymentLoading ? "Processing Razorpay Capture..." : `Pay ₹${fiatOrder.feeDetails.grossRupees.toLocaleString("en-IN")} via Razorpay`}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Formal Receipt Modal */}
+      {receipt && (
+        <div className="modal-backdrop">
+          <div className="glass-panel modal-card" style={{ maxWidth: "520px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1rem" }}>
+              <h3 style={{ margin: 0, display: "flex", alignItems: "center", gap: "0.5rem", color: "var(--accent-emerald)" }}>
+                <CheckCircle2 size={20} />
+                Payment Receipt
+              </h3>
+              <button
+                className="btn-outline"
+                style={{ padding: "0.25rem 0.5rem", border: "none" }}
+                onClick={() => setReceipt(null)}
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <div style={{ background: "rgba(0,0,0,0.25)", padding: "1.25rem", borderRadius: "8px", border: "1px solid rgba(255,255,255,0.08)", fontSize: "0.85rem", display: "flex", flexDirection: "column", gap: "0.6rem" }}>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span style={{ color: "var(--text-muted)" }}>Receipt #:</span>
+                <span style={{ fontFamily: "monospace", fontWeight: 700 }}>{receipt.receiptNumber}</span>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span style={{ color: "var(--text-muted)" }}>Status:</span>
+                <span className="status-badge status-active">{receipt.status}</span>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span style={{ color: "var(--text-muted)" }}>Razorpay Payment ID:</span>
+                <span style={{ fontFamily: "monospace" }}>{receipt.razorpayPaymentId}</span>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span style={{ color: "var(--text-muted)" }}>Gross Rent Paid:</span>
+                <span style={{ fontWeight: 700 }}>₹{receipt.grossAmountRupees.toLocaleString("en-IN")}</span>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span style={{ color: "var(--text-muted)" }}>Platform Fee (3%):</span>
+                <span>₹{receipt.platformFeeRupees.toLocaleString("en-IN")}</span>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span style={{ color: "var(--text-muted)" }}>Landlord Payout:</span>
+                <span style={{ color: "var(--accent-emerald)", fontWeight: 600 }}>₹{receipt.landlordAllocationRupees.toLocaleString("en-IN")}</span>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span style={{ color: "var(--text-muted)" }}>Date:</span>
+                <span>{new Date(receipt.capturedAt || receipt.createdAt).toLocaleString()}</span>
+              </div>
+            </div>
+
+            <div style={{ marginTop: "1.25rem", display: "flex", gap: "0.75rem" }}>
+              <button
+                className="btn-outline"
+                style={{ flex: 1, justifyContent: "center" }}
+                onClick={() => window.print()}
+              >
+                <FileText size={16} /> Print Receipt
+              </button>
+              <button
+                className="btn-primary"
+                style={{ flex: 1, justifyContent: "center" }}
+                onClick={() => setReceipt(null)}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -24,13 +24,15 @@ test.after(() => {
 });
 
 const makeRequest = async (path, options = {}) => {
-  const { headers = {}, ...rest } = options;
+  const { headers = {}, body, ...rest } = options;
   const url = `${baseUrl}${path}`;
+  const isFormData = typeof FormData !== "undefined" && body instanceof FormData;
+  const requestHeaders = isFormData
+    ? { ...headers }
+    : { "Content-Type": "application/json", ...headers };
   const response = await fetch(url, {
-    headers: {
-      "Content-Type": "application/json",
-      ...headers
-    },
+    headers: requestHeaders,
+    body,
     ...rest
   });
   const data = await response.json().catch(() => ({}));
@@ -41,10 +43,23 @@ test("Backend API Test Suite", async (t) => {
   let adminToken = "";
   let tenantToken = "";
 
-  await t.test("GET /api/health returns healthy status", async () => {
+  await t.test("GET /api/health returns healthy status and deep observability checks", async () => {
     const res = await makeRequest("/api/health");
     assert.equal(res.status, 200);
     assert.equal(res.data.status, "healthy");
+    assert.equal(res.data.checks.database, "connected");
+    assert.ok(typeof res.data.checks.queue.pending === "number");
+    assert.ok(res.data.uptimeSeconds >= 0);
+  });
+
+  await t.test("GET /api/health/live and /api/health/ready respond successfully", async () => {
+    const live = await makeRequest("/api/health/live");
+    assert.equal(live.status, 200);
+    assert.equal(live.data.status, "alive");
+
+    const ready = await makeRequest("/api/health/ready");
+    assert.equal(ready.status, 200);
+    assert.equal(ready.data.status, "ready");
   });
 
   await t.test("POST /api/auth/login rejects incorrect password", async () => {
@@ -95,6 +110,25 @@ test("Backend API Test Suite", async (t) => {
     assert.ok(res.data.length >= 1);
   });
 
+  await t.test("HIGH-01 Defense: Tenant agreement query isolates active leases and blocks companyId bypass", async () => {
+    // Tenant lists agreements
+    const listRes = await makeRequest("/api/agreements", {
+      headers: { Authorization: `Bearer ${tenantToken}` }
+    });
+    assert.equal(listRes.status, 200);
+    // Tenant does not own agreement_001
+    const hasAgreement001 = listRes.data.some((a) => a.id === "agreement_001");
+    assert.strictEqual(hasAgreement001, false, "Tenant must not see unowned agreements even if active");
+
+    // Tenant attempts companyId query bypass
+    const companyRes = await makeRequest("/api/agreements?companyId=Company_A", {
+      headers: { Authorization: `Bearer ${tenantToken}` }
+    });
+    assert.equal(companyRes.status, 200);
+    const hasCompanyA = companyRes.data.some((a) => a.id === "agreement_001");
+    assert.strictEqual(hasCompanyA, false, "Company ID query param must not bypass tenant data isolation");
+  });
+
   await t.test("POST /api/agreements creates new agreement with validation", async () => {
     const res = await makeRequest("/api/agreements", {
       method: "POST",
@@ -120,7 +154,7 @@ test("Backend API Test Suite", async (t) => {
       method: "POST",
       body: JSON.stringify({
         agreementId: "agreement_001",
-        providedPdfHash: "a2b585dd299e03d12FA4293BC5de4111afa1a4b94908f83103eb1f1706367c2e6"
+        providedPdfHash: "a2b585dd299e03d12fa4293bc5de4111afa1a4b94908f83103eb1f1706367c2e"
       })
     });
     assert.equal(res.status, 200);
@@ -163,4 +197,62 @@ test("Backend API Test Suite", async (t) => {
     assert.ok(res.data.totalAgreements >= 1);
     assert.ok(res.data.totalLogs >= 1);
   });
+
+  await t.test("GET /api/agreements/:id prevents unauthorized IDOR/BOLA access", async () => {
+    // Tenant attempts to read agreement_001 where tenant_address is 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 (not tenant@gmail.com)
+    const unauthorizedRes = await makeRequest("/api/agreements/agreement_001", {
+      headers: { Authorization: `Bearer ${tenantToken}` }
+    });
+    assert.equal(unauthorizedRes.status, 403);
+    assert.match(unauthorizedRes.data.error, /Access denied/);
+
+    // Admin should have access
+    const adminRes = await makeRequest("/api/agreements/agreement_001", {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    assert.equal(adminRes.status, 200);
+    assert.equal(adminRes.data.id, "agreement_001");
+  });
+
+  await t.test("POST /api/verifyDocumentFile hashes file server-side without trusting client hash", async () => {
+    const formData = new FormData();
+    formData.append("agreementId", "agreement_001");
+    const fileBlob = new Blob(["sample agreement contract text content"], { type: "text/plain" });
+    formData.append("file", fileBlob, "sample_contract.txt");
+
+    const res = await makeRequest("/api/verifyDocumentFile", {
+      method: "POST",
+      body: formData
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.data.agreementId, "agreement_001");
+    assert.equal(res.data.fileName, "sample_contract.txt");
+    assert.ok(typeof res.data.serverComputedHash === "string");
+    assert.equal(res.data.isValid, false); // Mismatches seeded hash
+  });
+
+  await t.test("POST /api/verifyDocumentFile rejects forbidden MIME types", async () => {
+    const formData = new FormData();
+    formData.append("agreementId", "agreement_001");
+    const maliciousBlob = new Blob(["#!/bin/bash\necho bad"], { type: "application/x-sh" });
+    formData.append("file", maliciousBlob, "exploit.sh");
+
+    const res = await makeRequest("/api/verifyDocumentFile", {
+      method: "POST",
+      body: formData
+    });
+    assert.equal(res.status, 400);
+    assert.match(res.data.error, /Invalid document format/);
+  });
+
+  await t.test("Payload size limit rejects payloads exceeding 50kb", async () => {
+    const hugeData = "x".repeat(60 * 1024);
+    const res = await makeRequest("/api/agreements", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({ propertyDetails: hugeData })
+    });
+    assert.equal(res.status, 413); // Payload Too Large
+  });
 });
+

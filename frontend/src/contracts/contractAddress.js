@@ -1,5 +1,4 @@
 export const CONTRACT_ADDRESSES = {
-  RentalAgreementFactory: "0x5FbDB2315678afecb367f032d93F642f64180aa3",
-  MultiTenantRentalPlatform: "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512",
-  SampleAgreement: "0xa16E02E87b7454126E5E10d957A927A7F5B5d2be"
+  RentalAgreementFactory: (typeof import.meta !== "undefined" && import.meta.env?.VITE_FACTORY_ADDRESS) || "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+  SampleAgreement: (typeof import.meta !== "undefined" && import.meta.env?.VITE_SAMPLE_AGREEMENT_ADDRESS) || "0xa16E02E87b7454126E5E10d957A927A7F5B5d2be"
 };

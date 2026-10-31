@@ -24,11 +24,18 @@ dist-ssr/
 .env
 .env*.local
 
-# Database
+# Database & Backups
 *.sqlite
+*.sqlite-wal
+*.sqlite-shm
 *.sqlite-journal
 *.db
 *.db-journal
+backups/
+
+# Document Uploads
+backend/uploads/*
+!backend/uploads/.gitkeep
 
 # OS files
 Thumbs.db

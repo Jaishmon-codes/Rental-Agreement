@@ -190,17 +190,100 @@ describe("RentalAgreement System", function () {
         expect(tenantBalanceAfter - tenantBalanceBefore).to.equal(securityDeposit);
       });
 
-      it("should end agreement and give deposit to landlord if property is NOT OK", async function () {
+      it("should end agreement and enforce dispute timelock before giving deposit to landlord if property is NOT OK", async function () {
         const landlordBalanceBefore = await ethers.provider.getBalance(landlord.address);
         
+        // Landlord initiates claim
         const tx = await agreement.connect(landlord).endAgreement(false);
         const receipt = await tx.wait();
         const gasUsed = receipt.gasUsed * receipt.gasPrice;
 
         expect(await agreement.active()).to.be.false;
+        expect(await agreement.status()).to.equal(2n); // Status.TERMINATION_REQUESTED
+        expect(await agreement.damageClaimed()).to.be.true;
+
+        // CRIT-02 Protection: Landlord cannot immediately seize funds
+        const balanceMid = await ethers.provider.getBalance(landlord.address);
+        expect(balanceMid + gasUsed - landlordBalanceBefore).to.equal(0n);
+
+        // Premature finalization should revert
+        await expect(agreement.finalizeClaim()).to.be.revertedWith("Dispute window still open");
+
+        // Advance past dispute period (3 days)
+        await ethers.provider.send("evm_increaseTime", [3 * 24 * 60 * 60 + 1]);
+        await ethers.provider.send("evm_mine");
+
+        // Landlord finalizes claim
+        const finalTx = await agreement.connect(landlord).finalizeClaim();
+        const finalReceipt = await finalTx.wait();
+        const finalGas = finalReceipt.gasUsed * finalReceipt.gasPrice;
 
         const landlordBalanceAfter = await ethers.provider.getBalance(landlord.address);
-        expect(landlordBalanceAfter + gasUsed - landlordBalanceBefore).to.equal(securityDeposit);
+        expect(landlordBalanceAfter + gasUsed + finalGas - landlordBalanceBefore).to.equal(securityDeposit);
+        expect(await agreement.status()).to.equal(4n); // Status.SETTLED
+      });
+
+      it("CRIT-02: should allow tenant to dispute damage claim within window", async function () {
+        await agreement.connect(landlord).endAgreement(false);
+        expect(await agreement.status()).to.equal(2n); // TERMINATION_REQUESTED
+
+        // Tenant disputes
+        await agreement.connect(tenant).disputeClaim("Normal wear and tear; damage not caused by tenant");
+        expect(await agreement.status()).to.equal(3n); // DISPUTED
+        expect(await agreement.damageReason()).to.equal("Normal wear and tear; damage not caused by tenant");
+
+        // Finalize claim reverts because contract is in dispute
+        await ethers.provider.send("evm_increaseTime", [4 * 24 * 60 * 60]);
+        await ethers.provider.send("evm_mine");
+        await expect(agreement.finalizeClaim()).to.be.revertedWith("Not pending termination claim");
+
+        // Adversarial Check: Landlord attempts resolveDispute() -> REVERTS
+        const tenantShare = ethers.parseEther("0.1");
+        const landlordShare = ethers.parseEther("0.1");
+        await expect(
+          agreement.connect(landlord).resolveDispute(landlordShare, tenantShare)
+        ).to.be.revertedWith("Unauthorized arbitrator");
+
+        // Adversarial Check: Tenant attempts resolveDispute() -> REVERTS
+        await expect(
+          agreement.connect(tenant).resolveDispute(tenantShare, landlordShare)
+        ).to.be.revertedWith("Unauthorized arbitrator");
+
+        // Adversarial Check: Third party attempts resolveDispute() -> REVERTS
+        await expect(
+          agreement.connect(other).resolveDispute(landlordShare, tenantShare)
+        ).to.be.revertedWith("Unauthorized arbitrator");
+
+        // Adversarial Check: Arbitrator attempts invalid split total -> REVERTS
+        await expect(
+          agreement.connect(owner).resolveDispute(ethers.parseEther("0.15"), ethers.parseEther("0.15"))
+        ).to.be.revertedWith("Invalid split total");
+
+        // Authorized arbitrator resolves dispute with fair split
+        await agreement.connect(owner).resolveDispute(landlordShare, tenantShare);
+        expect(await agreement.status()).to.equal(4n); // SETTLED
+
+        // Adversarial Check: Repeated resolution after already resolved -> REVERTS
+        await expect(
+          agreement.connect(owner).resolveDispute(landlordShare, tenantShare)
+        ).to.be.revertedWith("Contract is not in dispute");
+      });
+
+      it("CRIT-02: should prevent dispute resolution before contract enters DISPUTED status", async function () {
+        await expect(
+          agreement.connect(owner).resolveDispute(ethers.parseEther("0.1"), ethers.parseEther("0.1"))
+        ).to.be.revertedWith("Contract is not in dispute");
+      });
+
+      it("CRIT-02: should allow tenant to accept damage claim immediately", async function () {
+        await agreement.connect(landlord).endAgreement(false);
+
+        const landlordBalBefore = await ethers.provider.getBalance(landlord.address);
+        await agreement.connect(tenant).acceptClaim();
+
+        const landlordBalAfter = await ethers.provider.getBalance(landlord.address);
+        expect(landlordBalAfter - landlordBalBefore).to.equal(securityDeposit);
+        expect(await agreement.status()).to.equal(4n); // SETTLED
       });
 
       it("should reject invalid rent payment amounts", async function () {
@@ -277,6 +360,97 @@ describe("RentalAgreement System", function () {
         expect(await agreement.active()).to.be.false;
         const tenantBalanceAfter = await ethers.provider.getBalance(tenant.address);
         expect(tenantBalanceAfter - tenantBalanceBefore).to.equal(securityDeposit);
+      });
+
+      it("CRIT-03 Defense: Reverting receiver cannot DoS contract during termination or autoExpire (Pull-over-Push)", async function () {
+        // Deploy a new agreement for reverting receiver test
+        const createTx = await factory.connect(landlord).createAgreement(
+          rentAmount,
+          securityDeposit,
+          durationInDays,
+          "Revert Test Property",
+          "doc_revert_hash"
+        );
+        const receipt = await createTx.wait();
+        const event = receipt.logs.find(
+          (log) => factory.interface.parseLog(log)?.name === "AgreementCreated"
+        );
+        const revAgreementAddr = factory.interface.parseLog(event).args.agreementAddress;
+        const revAgreement = await ethers.getContractAt("RentalAgreement", revAgreementAddr);
+
+        // Deploy malicious reverting receiver contract
+        const ReverterFactory = await ethers.getContractFactory("RevertingReceiver");
+        const reverter = await ReverterFactory.deploy();
+        await reverter.waitForDeployment();
+        const reverterAddress = await reverter.getAddress();
+
+        // Reverting contract joins as tenant
+        await reverter.join(revAgreementAddr, { value: rentAmount + securityDeposit });
+        expect(await revAgreement.tenant()).to.equal(reverterAddress);
+        expect(await revAgreement.active()).to.be.true;
+
+        // Landlord ends agreement (property ok -> refund to reverting tenant)
+        // With Pull-over-Push, this must NOT revert even though reverter rejects ETH!
+        const endTx = await revAgreement.connect(landlord).endAgreement(true);
+        await endTx.wait();
+
+        expect(await revAgreement.active()).to.be.false;
+        expect(await revAgreement.status()).to.equal(4n); // Status.SETTLED
+
+        // Deposit is safely credited in pendingWithdrawals
+        expect(await revAgreement.pendingWithdrawals(reverterAddress)).to.equal(securityDeposit);
+
+        // When reverter enables receiving ETH, it can pull its refund safely
+        await reverter.setShouldRevert(false);
+        const reverterBalBefore = await ethers.provider.getBalance(reverterAddress);
+        await reverter.callWithdrawRefund(revAgreementAddr);
+        const reverterBalAfter = await ethers.provider.getBalance(reverterAddress);
+
+        expect(reverterBalAfter - reverterBalBefore).to.equal(securityDeposit);
+        expect(await revAgreement.pendingWithdrawals(reverterAddress)).to.equal(0n);
+      });
+
+      it("Invariant Check: Contract balance is always >= securityDeposit while active", async function () {
+        // Initially after join: rent + deposit
+        expect(await agreement.getBalance()).to.equal(rentAmount + securityDeposit);
+
+        // Landlord claims initial rent
+        await (await agreement.connect(landlord).claimRent()).wait();
+        expect(await agreement.getBalance()).to.equal(securityDeposit);
+
+        // Tenant pays next rent
+        await (await agreement.connect(tenant).payNextRent({ value: rentAmount })).wait();
+        expect(await agreement.getBalance()).to.equal(rentAmount + securityDeposit);
+
+        // Landlord claims again
+        await (await agreement.connect(landlord).claimRent()).wait();
+        // Invariant holds: balance is never depleted below securityDeposit
+        expect(await agreement.getBalance()).to.be.at.least(securityDeposit);
+      });
+    });
+
+    describe("Factory Scalability (MED-04)", function () {
+      it("MED-04 Defense: should support paginated retrieval of agreements", async function () {
+        for (let i = 0; i < 3; i++) {
+          await (await factory.connect(landlord).createAgreement(
+            rentAmount,
+            securityDeposit,
+            durationInDays,
+            `Property ${i}`,
+            `hash_${i}`
+          )).wait();
+        }
+
+        const totalCount = await factory.getAgreementsCount();
+        expect(totalCount).to.be.at.least(3n);
+
+        const [page1, total1] = await factory.getAgreementsPaginated(0, 2);
+        expect(page1.length).to.equal(2);
+        expect(total1).to.equal(totalCount);
+
+        const [page2, total2] = await factory.getAgreementsPaginated(2, 2);
+        expect(page2.length).to.be.at.least(1);
+        expect(total2).to.equal(totalCount);
       });
     });
   });

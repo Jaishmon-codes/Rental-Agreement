@@ -1,7 +1,7 @@
 {
   "name": "rentalagreement-main",
-  "version": "1.0.0",
-  "description": "Welcome to your new **Remix IDE Blank Workspace**!",
+  "version": "1.0.0-beta",
+  "description": "RentSphere — Hybrid Web3 & Enterprise Rental Management Platform",
   "main": "index.js",
   "scripts": {
     "compile": "hardhat compile",
